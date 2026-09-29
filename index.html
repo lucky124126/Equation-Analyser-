@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Shape Recognizer</title>
+    <!--
+        Get a free API key from https://www.desmos.com/api?lang=en
+        ("Get an API key") and paste it into the URL below in place of
+        YOUR_API_KEY_HERE. Without a real key, Desmos still loads but
+        shows a demo/invalid-key watermark.
+    -->
+    <script src="https://www.desmos.com/api/v1.11/calculator.js?apiKey=YOUR_API_KEY_HERE"></script>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background: #f9f9f9; padding: 20px; }
+        .panels { display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; }
+        .panel { display: flex; flex-direction: column; align-items: center; }
+        .panel h3 { margin: 0 0 6px 0; color: #444; font-size: 0.95em; font-weight: 600; }
+        canvas { border: 2px solid #333; background: white; cursor: crosshair; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        #calculator { width: 600px; height: 400px; border: 2px solid #333; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .controls { margin-top: 15px; display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+        button { padding: 8px 16px; cursor: pointer; background: #2e86c1; color: white; border: none; border-radius: 4px; }
+        button.mic { background: #c0392b; }
+        button.mic.listening { background: #e74c3c; animation: pulse 1s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+        #result { margin-top: 15px; font-weight: bold; color: #1a5276; font-size: 1.1em; text-align: center; min-height: 1.5em; }
+        #voiceStatus { margin-top: 8px; color: #555; font-size: 0.95em; text-align: center; min-height: 1.2em; }
+        #examples { margin-top: 10px; font-size: 0.8em; color: #888; max-width: 900px; text-align: center; }
+        #examples code { background: #eee; padding: 1px 5px; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div id="result">Draw a shape (Line, Circle, Ellipse, Parabola) or use your voice</div>
+
+    <div class="panels">
+        <div class="panel">
+            <h3>Draw here</h3>
+            <canvas id="canvas" width="600" height="400"></canvas>
+        </div>
+        <div class="panel">
+            <h3>Desmos graph</h3>
+            <div id="calculator"></div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button onclick="clearCanvas()">Clear Canvas</button>
+        <button id="micBtn" class="mic" onclick="toggleListening()">🎤 Voice Command</button>
+    </div>
+    <div id="voiceStatus"></div>
+    <div id="examples">
+        Try saying: <code>circle of radius 5 centered at 2 3</code> ·
+        <code>parabola opening downward vertex at 1 2</code> ·
+        <code>line through 0 0 and 4 4</code> ·
+        <code>ellipse semi axes 3 and 1.5 centered at 0 0</code>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const resultDiv = document.getElementById('result');
+        const voiceStatus = document.getElementById('voiceStatus');
+        const micBtn = document.getElementById('micBtn');
+        let drawing = false;
+        let points = [];
+
+        // ---------- Desmos setup ----------
+        let calculator = null;
+        try {
+            if (typeof Desmos !== 'undefined') {
+                calculator = Desmos.GraphingCalculator(document.getElementById('calculator'), {
+                    keypad: false,
+                    settingsMenu: false
+                });
+            }
+        } catch (e) {
+            console.error('Desmos failed to load:', e);
+        }
+
+        function setDesmosShape(latex) {
+            if (!calculator || !latex) return;
+            calculator.setExpression({id: 'fit', latex: latex, color: Desmos.Colors.BLUE});
+        }
+
+        function setDesmosPoints(xs, ys) {
+            if (!calculator) return;
+            const xList = xs.map(v => v.toFixed(3)).join(',');
+            const yList = ys.map(v => v.toFixed(3)).join(',');
+            calculator.setExpression({id: 'ptsX', latex: `X_{1}=[${xList}]`});
+            calculator.setExpression({id: 'ptsY', latex: `Y_{1}=[${yList}]`});
+            calculator.setExpression({id: 'ptsPlot', latex: '(X_{1},Y_{1})', color: Desmos.Colors.GREEN});
+        }
+
+        function clearDesmos() {
+            if (!calculator) return;
+            calculator.setBlank();
+        }
+
+        // ---------- equation builders (Desmos-ready LaTeX) ----------
+        function buildLatexFromFit(data) {
+            const p = data.params;
+            if (!p) return '';
+            switch (data.type) {
+                case 'line': {
+                    const [a, b, c] = p;
+                    return `(${a})x+(${b})y=(${c})`;
+                }
+                case 'circle': {
+                    const [cx, cy, r] = p;
+                    return `(x-(${cx}))^{2}+(y-(${cy}))^{2}=(${r * r})`;
+                }
+                case 'parabola': {
+                    const [p0, p1, p2] = p;
+                    return data.orientation === 'x(y)'
+                        ? `x=(${p0})y^{2}+(${p1})y+(${p2})`
+                        : `y=(${p0})x^{2}+(${p1})x+(${p2})`;
+                }
+                case 'ellipse': {
+                    const [A, B, C, D, E, F] = p;
+                    return `(${A})x^{2}+(${B})xy+(${C})y^{2}+(${D})x+(${E})y+(${F})=0`;
+                }
+                default:
+                    return '';
+            }
+        }
+
+        function buildLatexFromCommand(cmd) {
+            const p = cmd.params;
+            switch (cmd.type) {
+                case 'circle':
+                    return `(x-(${p.cx}))^{2}+(y-(${p.cy}))^{2}=(${p.radius * p.radius})`;
+                case 'ellipse':
+                    return `((x-(${p.cx}))/(${p.a}))^{2}+((y-(${p.cy}))/(${p.b}))^{2}=1`;
+                case 'parabola':
+                    return `y=(${p.a})(x-(${p.vx}))^{2}+(${p.vy})`;
+                case 'line':
+                    if (p.mode === 'points') {
+                        const {x1, y1, x2, y2} = p;
+                        if (Math.abs(x2 - x1) < 1e-9) return `x=(${x1})`;
+                        const slope = (y2 - y1) / (x2 - x1);
+                        const intercept = y1 - slope * x1;
+                        return `y=(${slope})x+(${intercept})`;
+                    }
+                    return `y=(${p.slope})x+(${p.intercept})`;
+                default:
+                    return '';
+            }
+        }
+
+        function drawGrid() {
+            ctx.strokeStyle = '#f0f0f0';
+            for(let i=0; i<canvas.width; i+=25) { ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,canvas.height); ctx.stroke(); }
+            for(let i=0; i<canvas.height; i+=25) { ctx.beginPath(); ctx.moveTo(0,i); ctx.lineTo(canvas.width,i); ctx.stroke(); }
+            ctx.strokeStyle = '#ccc';
+            ctx.beginPath(); ctx.moveTo(300, 0); ctx.lineTo(300, 400); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(0, 200); ctx.lineTo(600, 200); ctx.stroke();
+        }
+        drawGrid();
+
+        function toPixel(x, y) {
+            return [300 + x * 25, 200 - y * 25];
+        }
+
+        // ---------- shared fit request, used by both mouse drawing and voice ----------
+        async function submitPoints(pts, updateDesmosFit = true) {
+            if (pts.length < 5) return;
+            resultDiv.innerText = "Processing...";
+            try {
+                const response = await fetch('/api/recognize', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({points: pts})
+                });
+                const data = await response.json();
+                resultDiv.innerText = `${data.type.toUpperCase()} (${(data.confidence*100).toFixed(0)}% accuracy): ${data.equation}`;
+                if (updateDesmosFit) setDesmosShape(buildLatexFromFit(data));
+                setDesmosPoints(pts.map(p => p[0]), pts.map(p => p[1]));
+            } catch (err) {
+                resultDiv.innerText = "Connection error reaching /api/recognize.";
+            }
+        }
+
+        // ---------- mouse drawing ----------
+        canvas.onmousedown = (e) => {
+            drawing = true;
+            points = [];
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            drawGrid();
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = '#2e86c1';
+            ctx.beginPath();
+            ctx.moveTo(e.offsetX, e.offsetY);
+        };
+
+        canvas.onmousemove = (e) => {
+            if(!drawing) return;
+            ctx.lineTo(e.offsetX, e.offsetY);
+            ctx.stroke();
+            points.push([(e.offsetX - 300)/25, (200 - e.offsetY)/25]);
+        };
+
+        canvas.onmouseup = () => {
+            drawing = false;
+            submitPoints(points);
+        };
+
+        function clearCanvas() {
+            ctx.clearRect(0,0,canvas.width,canvas.height);
+            drawGrid();
+            resultDiv.innerText = "Draw a shape on the grid";
+            clearDesmos();
+        }
+
+        // ---------- voice commands ----------
+        function wordsToDigits(text) {
+            const map = {zero:0,one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9,
+                ten:10,eleven:11,twelve:12,thirteen:13,fourteen:14,fifteen:15,sixteen:16,
+                seventeen:17,eighteen:18,nineteen:19,twenty:20};
+            let t = text.toLowerCase();
+            t = t.replace(/negative|minus/g, ' -');
+            t = t.replace(/\bpoint\b/g, '.');
+            for (const [word, num] of Object.entries(map)) {
+                t = t.replace(new RegExp('\\b' + word + '\\b', 'g'), num);
+            }
+            t = t.replace(/,/g, ' ');
+            return t;
+        }
+
+        function parseCommand(raw) {
+            const lower = wordsToDigits(raw);
+
+            if (lower.includes('circle')) {
+                const radiusMatch = lower.match(/radius\D*(-?\d+\.?\d*)/);
+                const centerMatch = lower.match(/(?:at|center|centre)\D*(-?\d+\.?\d*)\D+(-?\d+\.?\d*)/);
+                const radius = radiusMatch ? parseFloat(radiusMatch[1]) : 3;
+                const cx = centerMatch ? parseFloat(centerMatch[1]) : 0;
+                const cy = centerMatch ? parseFloat(centerMatch[2]) : 0;
+                return {type: 'circle', params: {radius, cx, cy}};
+            }
+
+            if (lower.includes('ellipse')) {
+                const axesMatch = lower.match(/(?:semi.?axes|axes|width and height)\D*(-?\d+\.?\d*)\D+(-?\d+\.?\d*)/);
+                const centerMatch = lower.match(/(?:center|centre)\D*(-?\d+\.?\d*)\D+(-?\d+\.?\d*)/);
+                const a = axesMatch ? parseFloat(axesMatch[1]) : 3;
+                const b = axesMatch ? parseFloat(axesMatch[2]) : 1.5;
+                const cx = centerMatch ? parseFloat(centerMatch[1]) : 0;
+                const cy = centerMatch ? parseFloat(centerMatch[2]) : 0;
+                return {type: 'ellipse', params: {a, b, cx, cy}};
+            }
+
+            if (lower.includes('parabola')) {
+                const vertexMatch = lower.match(/vertex\D*(-?\d+\.?\d*)\D+(-?\d+\.?\d*)/);
+                const vx = vertexMatch ? parseFloat(vertexMatch[1]) : 0;
+                const vy = vertexMatch ? parseFloat(vertexMatch[2]) : 0;
+                const downward = /downward|facing down|opening down|pointing down/.test(lower);
+                const coeffMatch = lower.match(/coefficient\D*(-?\d+\.?\d*)/);
+                let a = coeffMatch ? parseFloat(coeffMatch[1]) : 1;
+                if (downward) a = -Math.abs(a);
+                return {type: 'parabola', params: {a, vx, vy}};
+            }
+
+            if (lower.includes('line')) {
+                const throughMatch = lower.match(/through\D*(-?\d+\.?\d*)\D+(-?\d+\.?\d*)\D+(-?\d+\.?\d*)\D+(-?\d+\.?\d*)/);
+                if (throughMatch) {
+                    const [x1, y1, x2, y2] = throughMatch.slice(1).map(Number);
+                    return {type: 'line', params: {mode: 'points', x1, y1, x2, y2}};
+                }
+                const slopeMatch = lower.match(/slope\D*(-?\d+\.?\d*)/);
+                const interceptMatch = lower.match(/intercept\D*(-?\d+\.?\d*)/);
+                const slope = slopeMatch ? parseFloat(slopeMatch[1]) : 1;
+                const intercept = interceptMatch ? parseFloat(interceptMatch[1]) : 0;
+                return {type: 'line', params: {mode: 'slope', slope, intercept}};
+            }
+
+            return null;
+        }
+
+        function generateShapePoints(cmd) {
+            const pts = [];
+            const n = 60;
+            if (cmd.type === 'circle') {
+                const {radius, cx, cy} = cmd.params;
+                for (let i = 0; i <= n; i++) {
+                    const t = (i / n) * 2 * Math.PI;
+                    pts.push([cx + radius * Math.cos(t), cy + radius * Math.sin(t)]);
+                }
+            } else if (cmd.type === 'ellipse') {
+                const {a, b, cx, cy} = cmd.params;
+                for (let i = 0; i <= n; i++) {
+                    const t = (i / n) * 2 * Math.PI;
+                    pts.push([cx + a * Math.cos(t), cy + b * Math.sin(t)]);
+                }
+            } else if (cmd.type === 'parabola') {
+                const {a, vx, vy} = cmd.params;
+                for (let i = 0; i <= n; i++) {
+                    const x = -4 + (8 * i / n);
+                    pts.push([vx + x, vy + a * x * x]);
+                }
+            } else if (cmd.type === 'line') {
+                if (cmd.params.mode === 'points') {
+                    const {x1, y1, x2, y2} = cmd.params;
+                    for (let i = 0; i <= n; i++) {
+                        const t = i / n;
+                        pts.push([x1 + (x2 - x1) * t, y1 + (y2 - y1) * t]);
+                    }
+                } else {
+                    const {slope, intercept} = cmd.params;
+                    for (let i = 0; i <= n; i++) {
+                        const x = -6 + (12 * i / n);
+                        pts.push([x, slope * x + intercept]);
+                    }
+                }
+            }
+            return pts;
+        }
+
+        function drawGeneratedShape(mathPts) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            drawGrid();
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = '#27ae60';
+            ctx.beginPath();
+            mathPts.forEach(([x, y], i) => {
+                const [px, py] = toPixel(x, y);
+                if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+            });
+            ctx.stroke();
+        }
+
+        let recognition = null;
+        let listening = false;
+
+        function initRecognition() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) {
+                voiceStatus.innerText = "Voice recognition isn't supported in this browser (try Chrome).";
+                micBtn.disabled = true;
+                return null;
+            }
+            const rec = new SpeechRecognition();
+            rec.lang = 'en-US';
+            rec.continuous = false;
+            rec.interimResults = false;
+
+            rec.onstart = () => {
+                listening = true;
+                micBtn.classList.add('listening');
+                voiceStatus.innerText = "Listening...";
+            };
+
+            rec.onresult = (event) => {
+                const transcript = event.results[0][0].transcript;
+                voiceStatus.innerText = `Heard: "${transcript}"`;
+                const cmd = parseCommand(transcript);
+                if (!cmd) {
+                    voiceStatus.innerText += " — couldn't understand that as a shape command.";
+                    return;
+                }
+                points = generateShapePoints(cmd);
+                drawGeneratedShape(points);
+                setDesmosShape(buildLatexFromCommand(cmd));
+                submitPoints(points, false);  // text/confidence only; Desmos already has the exact equation
+            };
+
+            rec.onerror = (event) => {
+                voiceStatus.innerText = `Voice error: ${event.error}`;
+            };
+
+            rec.onend = () => {
+                listening = false;
+                micBtn.classList.remove('listening');
+            };
+
+            return rec;
+        }
+
+        function toggleListening() {
+            if (!recognition) recognition = initRecognition();
+            if (!recognition) return;
+            if (listening) {
+                recognition.stop();
+            } else {
+                recognition.start();
+            }
+        }
+    </script>
+</body>
+</html>
